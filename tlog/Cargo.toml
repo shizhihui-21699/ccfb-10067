@@ -1,0 +1,25 @@
+[package]
+name = "tlog"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha2 = "0.10"
+ed25519-dalek = "2"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[[bin]]
+name = "tlog-server"
+path = "src/bin/tlog-server.rs"
+
+[[bin]]
+name = "tlog-verify"
+path = "src/bin/tlog-verify.rs"
+
+[[bin]]
+name = "tlog-bench"
+path = "src/bin/tlog-bench.rs"

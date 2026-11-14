@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>tlog — 制品签名透明日志</title>
+<style>
+  body { font-family: -apple-system, "SF Pro", "PingFang SC", monospace; margin: 2em auto; max-width: 960px; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.3em; } h2 { font-size: 1.05em; margin-top: 1.6em; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 1em 1.2em; margin: 1em 0; }
+  .kv { font-family: ui-monospace, Menlo, monospace; font-size: 0.82em; word-break: break-all; }
+  .kv b { color: #555; }
+  input, button { font: inherit; padding: 0.35em 0.6em; }
+  input { width: 10em; }
+  button { cursor: pointer; }
+  .ok { color: #0a7d2c; font-weight: 600; }
+  .bad { color: #c00; font-weight: 600; }
+  .hash { font-family: ui-monospace, Menlo, monospace; font-size: 0.78em; color: #444; }
+  ol { padding-left: 1.4em; }
+  #sth { background: #f7f7f9; }
+  label { color: #666; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<h1>tlog — 制品签名透明日志</h1>
+
+<div class="card" id="sth">
+  <h2>当前签名树头 (STH)</h2>
+  <div class="kv" id="sth-body">加载中…</div>
+</div>
+
+<div class="card">
+  <h2>追加记录</h2>
+  <label>记录内容(JSON,如 {"{"}"artifact":"app","version":"1.2.3","sha256":"…"{"}"}):</label><br><br>
+  <input id="append-data" style="width:70%" placeholder='{"artifact":"app","version":"1.2.3","sha256":"ab12…"}'>
+  <button onclick="doAppend()">追加</button>
+  <div class="kv" id="append-result"></div>
+</div>
+
+<div class="card">
+  <h2>查询记录与包含证明</h2>
+  <label>叶子序号:</label>
+  <input id="q-index" type="number" min="0" value="0">
+  <button onclick="doQuery()">查询</button>
+  <button onclick="doVerify()">在浏览器中验证</button>
+  <span id="verify-result"></span>
+  <div id="proof-body"></div>
+</div>
+
+<div class="card">
+  <h2>一致性证明</h2>
+  <label>从</label> <input id="c-first" type="number" min="1" value="1">
+  <label>到</label> <input id="c-second" type="number" min="1" value="1">
+  <button onclick="doConsistency()">查询</button>
+  <div id="cons-body"></div>
+</div>
+
+<script>
+let lastProof = null, lastSth = null, pubkeyHex = null;
+
+const hex2u8 = h => new Uint8Array(h.match(/.{2}/g).map(b => parseInt(b, 16)));
+const u82hex = b => [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+
+async function sha256(data) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+}
+const leafHash = async d => sha256(new Uint8Array([0x00, ...d]));
+const nodeHash = async (l, r) => sha256(new Uint8Array([0x01, ...l, ...r]));
+
+// largest power of 2 strictly less than n (RFC 6962 split point)
+function lpow2(n) { let k = 1; while ((k << 1) < n) k <<= 1; return k; }
+
+async function verifyPath(leaf, m, n, path) {
+  // recursive reconstruction mirroring RFC 6962
+  let i = 0;
+  async function rec(m, n) {
+    if (n === 1) return leaf;
+    const k = lpow2(n);
+    if (m < k) {
+      const l = await rec(m, k);
+      const r = path[i++];
+      return nodeHash(l, r);
+    } else {
+      const r = await rec(m - k, n - k);
+      const l = path[i++];
+      return nodeHash(l, r);
+    }
+  }
+  const root = await rec(m, n);
+  if (i !== path.length) return null;
+  return root;
+}
+
+function sthBytes(th) {
+  const enc = new TextEncoder();
+  const tag = enc.encode('TLOG-STH-v1');
+  const out = new Uint8Array(tag.length + 8 + 32 + 8);
+  out.set(tag, 0);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(tag.length, Math.floor(th.tree_size / 2**32));
+  dv.setUint32(tag.length + 4, th.tree_size >>> 0);
+  out.set(hex2u8(th.root_hash), tag.length + 8);
+  dv.setUint32(tag.length + 40, Math.floor(th.timestamp / 2**32));
+  dv.setUint32(tag.length + 44, th.timestamp >>> 0);
+  return out;
+}
+
+async function verifySthSig(th) {
+  try {
+    const key = await crypto.subtle.importKey('raw', hex2u8(pubkeyHex), {name: 'Ed25519'}, false, ['verify']);
+    return await crypto.subtle.verify('Ed25519', key, hex2u8(th.signature), sthBytes(th));
+  } catch (e) { return '浏览器不支持 Ed25519 验签: ' + e; }
+}
+
+async function loadSth() {
+  const [sth, pk] = await Promise.all([
+    fetch('/sth').then(r => r.json()).catch(() => null),
+    fetch('/pubkey').then(r => r.json()),
+  ]);
+  pubkeyHex = pk.pubkey;
+  lastSth = sth;
+  if (!sth) { document.getElementById('sth-body').textContent = '暂无签名树头'; return; }
+  const sigOk = await verifySthSig(sth);
+  document.getElementById('sth-body').innerHTML =
+    `<b>tree_size:</b> ${sth.tree_size}<br>` +
+    `<b>root_hash:</b> <span class="hash">${sth.root_hash}</span><br>` +
+    `<b>timestamp:</b> ${new Date(sth.timestamp * 1000).toLocaleString()}<br>` +
+    `<b>signature:</b> <span class="hash">${sth.signature.slice(0, 64)}…</span><br>` +
+    `<b>签名验证:</b> ${sigOk === true ? '<span class="ok">✓ 有效</span>' : '<span class="bad">✗ ' + sigOk + '</span>'}<br>` +
+    `<b>pubkey:</b> <span class="hash">${pubkeyHex}</span>`;
+  document.getElementById('c-second').value = sth.tree_size;
+}
+
+async function doAppend() {
+  const data = document.getElementById('append-data').value;
+  const r = await fetch('/append', {method: 'POST', body: JSON.stringify({data})});
+  const j = await r.json();
+  document.getElementById('append-result').innerHTML = j.error
+    ? `<span class="bad">${j.error}</span>`
+    : `✓ index=<b>${j.index}</b> leaf_hash=<span class="hash">${j.leaf_hash}</span> tree_size=${j.tree_size}`;
+  loadSth();
+}
+
+async function doQuery() {
+  const idx = document.getElementById('q-index').value;
+  const r = await fetch('/proof?index=' + idx);
+  const j = await r.json();
+  const el = document.getElementById('proof-body');
+  document.getElementById('verify-result').textContent = '';
+  if (j.error) { el.innerHTML = `<span class="bad">${j.error}</span>`; lastProof = null; return; }
+  lastProof = j;
+  let dataTxt = '';
+  try { dataTxt = new TextDecoder().decode(hex2u8(j.record_data_hex)); } catch (e) {}
+  el.innerHTML = `<div class="kv" style="margin-top:0.8em">` +
+    `<b>记录内容:</b> ${escapeHtml(dataTxt)}<br>` +
+    `<b>leaf_hash:</b> <span class="hash">${j.leaf_hash}</span><br>` +
+    `<b>tree_size:</b> ${j.tree_size}<br>` +
+    `<b>root:</b> <span class="hash">${j.root}</span><br>` +
+    `<b>审计路径 (${j.path.length} 个哈希):</b><ol>` +
+    j.path.map(h => `<li class="hash">${h}</li>`).join('') + `</ol></div>`;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function doVerify() {
+  const el = document.getElementById('verify-result');
+  if (!lastProof) { el.innerHTML = ' <span class="bad">请先查询</span>'; return; }
+  const data = hex2u8(lastProof.record_data_hex);
+  const leaf = await leafHash(data);
+  if (u82hex(leaf) !== lastProof.leaf_hash) {
+    el.innerHTML = ' <span class="bad">✗ 叶子哈希不匹配(记录被篡改)</span>'; return;
+  }
+  const path = lastProof.path.map(hex2u8);
+  const root = await verifyPath(leaf, lastProof.index, lastProof.tree_size, path);
+  if (!root) { el.innerHTML = ' <span class="bad">✗ 证明结构无效</span>'; return; }
+  const rootHex = u82hex(root);
+  if (rootHex !== lastProof.root) {
+    el.innerHTML = ' <span class="bad">✗ 重算根与树根不符(证明无效/被篡改)</span>'; return;
+  }
+  if (lastSth && lastProof.tree_size === lastSth.tree_size) {
+    if (rootHex !== lastSth.root_hash) {
+      el.innerHTML = ' <span class="bad">✗ 根与签名树头不符(分叉?)</span>'; return;
+    }
+    const sigOk = await verifySthSig(lastSth);
+    el.innerHTML = sigOk === true
+      ? ' <span class="ok">✓ 包含证明有效,STH 签名有效</span>'
+      : ' <span class="bad">✗ STH 签名无效</span>';
+  } else {
+    el.innerHTML = ' <span class="ok">✓ Merkle 路径有效</span>(树大小与最新 STH 不同,未核对签名)';
+  }
+}
+
+async function doConsistency() {
+  const f = document.getElementById('c-first').value;
+  const s = document.getElementById('c-second').value;
+  const r = await fetch(`/consistency?first=${f}&second=${s}`);
+  const j = await r.json();
+  const el = document.getElementById('cons-body');
+  if (j.error) { el.innerHTML = `<span class="bad">${j.error}</span>`; return; }
+  el.innerHTML = `<div class="kv" style="margin-top:0.8em"><b>证明 (${j.proof.length} 个哈希):</b><ol>` +
+    j.proof.map(h => `<li class="hash">${h}</li>`).join('') + `</ol>` +
+    `可用 <code>tlog-verify consistency</code> 离线验证两个 STH 之间的一致性。</div>`;
+}
+
+loadSth();
+</script>
+</body>
+</html>

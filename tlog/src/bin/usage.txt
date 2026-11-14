@@ -1,0 +1,16 @@
+tlog-verify — offline verification for the tlog transparency log
+
+Commands:
+  sth         Verify a signed tree head's signature
+              --sth sth.json --pubkey key.pub
+
+  inclusion   Verify a record's inclusion proof against a signed head
+              --proof proof.json --sth sth.json --pubkey key.pub
+
+  consistency Verify two signed heads are append-only consistent
+              --old sth1.json --new sth2.json --proof cons.json --pubkey key.pub
+
+  track       Track the latest STH; detect rollback/fork across runs
+              --state state.json --sth sth.json [--proof cons.json] --pubkey key.pub
+
+Exit codes: 0 ok · 1 error · 2 tampered · 3 rollback · 4 fork · 5 proof required
